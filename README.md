@@ -1,1 +1,13 @@
-# EventBus_Analysis
+# First Of All
+
+![MacDown logo](https://avatars1.githubusercontent.com/u/7877933?s=400&u=64953636998411d1947b76d5e7af4c63fde924b5&v=4)
+
+本库是为了分析EventBus的源码，为什么去分析，原因有以下几点：
+
+1、随着程序员的不断成长，你必须有一个能拿得出手的东西，如果只是停留在用的层面上，那么，你和别人说自己很特别，就显得很苍白
+
+2、就差这么一点，为什么这么说，所用即所得，阅读源码，分析源码的前提是你得会用，在Android上表现的会更具体，如果你不熟悉Application，那么怎么去熟悉Framework？能把一点做精，就可以说明很多问题
+
+3、自己的github需要点新的素材
+
+4、在此过程中，参考博客也会一一列举出来
