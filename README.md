@@ -86,7 +86,7 @@ struct logger_entry {
 
 ```
 
-<mark>struct logger_entry是一个用于描述一条Log记录的结构体</mark>。len成员变量记录了这条记录的有效负载的长度，有效负载指定的日志记录本身的长度，但是不包括用于描述这个记录的struct logger_entry结构体。我们调用android.util.Log接口来使用日志系统时，会指定日志的优先级别<mark>Priority、Tag字符串以及Msg字符串，Priority + Tag + Msg</mark>三者内容的长度加起来就是记录的有效负载长度了。__pad成员变量是用来对齐结构体的。pid和tid成员变量分别用来记录是哪条进程写入了这条记录。sec和nsec成员变量记录日志写的时间。msg成员变量记录的就有效负载的内容了，它的大小由len成员变量来确定。
+<font color=red size=5>struct logger_entry是一个用于描述一条Log记录的结构体</font>。len成员变量记录了这条记录的有效负载的长度，有效负载指定的日志记录本身的长度，但是不包括用于描述这个记录的struct logger_entry结构体。我们调用android.util.Log接口来使用日志系统时，会指定日志的优先级别<font color=red size=5>Priority、Tag字符串以及Msg字符串，Priority + Tag + Msg</font>三者内容的长度加起来就是记录的有效负载长度了。__pad成员变量是用来对齐结构体的。pid和tid成员变量分别用来记录是哪条进程写入了这条记录。sec和nsec成员变量记录日志写的时间。msg成员变量记录的就有效负载的内容了，它的大小由len成员变量来确定。
 
        接着定义两个宏：
 
@@ -138,11 +138,11 @@ struct logger_reader {
 #define logger_offset(n)	((n) & (log->size - 1))
 ```
 
-结构体struct logger_log就是真正用来保存日志的地方了。buffer成员变量变是用保存日志信息的内存缓冲区，它的大小由size成员变量确定。从misc成员变量可以看出，logger驱动程序使用的设备属于misc类型的设备，通过在Android模拟器上执行cat /proc/devices命令，可以看出，misc类型设备的主设备号是10。关于主设备号的相关知识，<mark>wq成员变量是一个等待队列，用于保存正在等待读取日志的进程  ???这里着实不能理解 ，等待队列 怎么保护进程？？？需求是什么样的？</mark>。readers成员变量用来保存当前正在读取日志的进程，正在读取日志的进程由结构体logger_reader来描述。mutex成员变量是一个互斥量，<mark>用来保护log的并发访问</mark>。可以看出，这里的日志系统的读写问题，其实是<mark>一个生产者-消费者的问题，因此，需要互斥量来保护log的并发访问</mark>。 w_off成员变量用来记录下一条日志应该从哪里开始写。head成员变量用来表示打开日志文件中，应该从哪一个位置开始读取日志。
+结构体struct logger_log就是真正用来保存日志的地方了。buffer成员变量变是用保存日志信息的内存缓冲区，它的大小由size成员变量确定。从misc成员变量可以看出，logger驱动程序使用的设备属于misc类型的设备，通过在Android模拟器上执行cat /proc/devices命令，可以看出，misc类型设备的主设备号是10。关于主设备号的相关知识，<font color=red size=5>wq成员变量是一个等待队列，用于保存正在等待读取日志的进程  ???这里着实不能理解 ，等待队列 怎么保护进程？？？需求是什么样的？</font>。readers成员变量用来保存当前正在读取日志的进程，正在读取日志的进程由结构体logger_reader来描述。mutex成员变量是一个互斥量，<font color=red size=5>用来保护log的并发访问</font>。可以看出，这里的日志系统的读写问题，其实是<font color=red size=5>一个生产者-消费者的问题，因此，需要互斥量来保护log的并发访问</font>。 w_off成员变量用来记录下一条日志应该从哪里开始写。head成员变量用来表示打开日志文件中，应该从哪一个位置开始读取日志。
 
        结构体struct logger_reader用来表示一个读取日志的进程，log成员变量指向要读取的日志缓冲区。list成员变量用来连接其它读者进程。r_off成员变量表示当前要读取的日志在缓冲区中的位置。
        
-       struct logger_log结构体中用于保存日志信息的内存缓冲区buffer是一个循环使用的<mark>环形缓冲区</mark>，缓冲区中保存的内容是以struct logger_entry为单位的，每个单位的组成为：
+       struct logger_log结构体中用于保存日志信息的内存缓冲区buffer是一个循环使用的<font color=red size=5>环形缓冲区</font>，缓冲区中保存的内容是以struct logger_entry为单位的，每个单位的组成为：
 
        struct logger_entry | priority | tag | msg
 
@@ -841,7 +841,7 @@ public final class Log {
 		int priority, String tag, String msg);
 }
 ```
-定义了2~7一共6个日志优先级别ID和4个日志缓冲区ID。在Logger驱动程序模块中，定义了<mark>log_main、log_events、log_radio </mark>分别对应三个设备文件<mark>dev/log/main、/dev/log/events/dev/log/radio</mark>。这里的4个日志缓冲区的前面3个ID就是对应这三个设备文件的文件描述符了，在下面的章节中，我们将看到这三个文件描述符是如何创建的。在下载下来的Android内核源代码中，第4个日志缓冲区LOG_ID_SYSTEM并没有对应的设备文件，在这种情况下，它和LOG_ID_MAIN对应同一个缓冲区ID，在下面的章节中，我们同样可以看到这两个ID是如何对应到同一个设备文件的。在整个Log接口中，最关键的地方声明了<mark>println _ native</mark>本地方法，所有的Log接口都是通过调用这个本地方法来实现Log的定入。下面我们就继续分析这个本地方法println_native。
+定义了2~7一共6个日志优先级别ID和4个日志缓冲区ID。在Logger驱动程序模块中，定义了<font color=red size=5>log_main、log_events、log_radio </font>分别对应三个设备文件<font color=red size=5>dev/log/main、/dev/log/events/dev/log/radio</font>。这里的4个日志缓冲区的前面3个ID就是对应这三个设备文件的文件描述符了，在下面的章节中，我们将看到这三个文件描述符是如何创建的。在下载下来的Android内核源代码中，第4个日志缓冲区LOG_ID_SYSTEM并没有对应的设备文件，在这种情况下，它和LOG_ID_MAIN对应同一个缓冲区ID，在下面的章节中，我们同样可以看到这两个ID是如何对应到同一个设备文件的。在整个Log接口中，最关键的地方声明了<font color=red size=5>println _ native</font>本地方法，所有的Log接口都是通过调用这个本地方法来实现Log的定入。下面我们就继续分析这个本地方法println_native。
 
 
 **应用程序框架层日志系统JNI方法的实现**
