@@ -16,9 +16,7 @@
 package org.greenrobot.eventbus.android;
 
 import android.util.Log;
-
 import org.greenrobot.eventbus.Logger;
-
 import java.util.logging.Level;
 
 public class AndroidLogger implements Logger {
@@ -38,7 +36,6 @@ public class AndroidLogger implements Logger {
     public static boolean isAndroidLogAvailable() {
         return ANDROID_LOG_AVAILABLE;
     }
-
 
     private final String tag;
 
