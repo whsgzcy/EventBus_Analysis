@@ -1171,10 +1171,161 @@ static int __write_to_log_kernel(log_id_t log_id, struct iovec *vec, size_t nr)
 
 4、对于log，java层只是调用，真正的实现确是在C
 
+
+## EventBus 源码分析
+
+从一开始的注释我们可以看出，这是一个单例，一个process-wide范围的单例，锁了一下
+
+这句代码其实是连续复制了
+
+instance = EventBus.defaultInstance = new EventBus();
+
+```
+/** Convenience singleton for apps using a process-wide EventBus instance. */
+    public static EventBus getDefault() {
+        EventBus instance = defaultInstance;
+        if (instance == null) {
+            synchronized (EventBus.class) {
+                instance = EventBus.defaultInstance;
+                if (instance == null) {
+                    instance = EventBus.defaultInstance = new EventBus();
+                }
+            }
+        }
+        return instance;
+    }
+```
+从使用的角度来说，在这里就是把event post出去，仔细分析一下，
+
+```
+ /** Posts the given event to the event bus. */
+    public void post(Object event) {
+        PostingThreadState postingState = currentPostingThreadState.get();
+        List<Object> eventQueue = postingState.eventQueue;
+        eventQueue.add(event);
+
+        if (!postingState.isPosting) {
+            postingState.isMainThread = isMainThread();
+            postingState.isPosting = true;
+            if (postingState.canceled) {
+                throw new EventBusException("Internal error. Abort state was not reset");
+            }
+            try {
+                while (!eventQueue.isEmpty()) {
+                    postSingleEvent(eventQueue.remove(0), postingState);
+                }
+            } finally {
+                postingState.isPosting = false;
+                postingState.isMainThread = false;
+            }
+        }
+    }
+```
+PostingThreadState postingState = currentPostingThreadState.get();
+
+ThreadLocal：
+java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
+说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
+说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
+
+不共享
+不可变
+使用正确的同步
+不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
+ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
+
+```
+private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
+        @Override
+        protected PostingThreadState initialValue() {
+            return new PostingThreadState();
+        }
+    };
+```
+
+```
+/** For ThreadLocal, much faster to set (and get multiple values). */
+    final static class PostingThreadState {
+        final List<Object> eventQueue = new ArrayList<>();
+        boolean isPosting;
+        boolean isMainThread;
+        Subscription subscription;
+        Object event;
+        boolean canceled;
+    }
+```
+
+这里的 isMainThread 是由 MainThreadSupport 负责，我也纳闷，这怎么判断是主线程还是子线程的？ 通过注释可以看出，通常android是android main线程
+
+是不是Main线程：return looper == Looper.myLooper();看到这里，我的想法，这里的实现是不是又在kernel实现的？
+
+从官网上看，就暂且理解为Thread.currentThread().getName()，Looper不为null都为Main Thread
+
+Looper.myLooper()
+
+Return the Looper object associated with the current thread. Returns null if the calling thread is not associated with a Looper.
+
+
+```
+/**
+ * Interface to the "main" thread, which can be whatever you like. Typically on Android, Android's main thread is used.
+ */
+public interface MainThreadSupport {
+
+    boolean isMainThread();
+
+    Poster createPoster(EventBus eventBus);
+
+    class AndroidHandlerMainThreadSupport implements MainThreadSupport {
+
+        private final Looper looper;
+
+        public AndroidHandlerMainThreadSupport(Looper looper) {
+            this.looper = looper;
+        }
+
+        @Override
+        public boolean isMainThread() {
+            return looper == Looper.myLooper();
+        }
+
+        @Override
+        public Poster createPoster(EventBus eventBus) {
+            return new HandlerPoster(eventBus, looper, 10);
+        }
+    }
+
+}
+```
+
+
+
+************************************************************
+1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
+
+java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
+说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
+说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
+
+不共享
+不可变
+使用正确的同步
+不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
+ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
+
+
 参考资料：
 
 https://www.cnblogs.com/dolphin0520/p/3799052.html
+
 https://www.cnblogs.com/sunzn/p/3187868.html
+
 https://blog.csdn.net/luoshengyang/article/details/6581828
+
 https://blog.csdn.net/Luoshengyang/article/details/6598703
+
 https://blog.csdn.net/luoshengyang/article/details/6595744
+
+https://liuzhengyang.github.io/2017/11/02/thread-local/
+
+https://developer.android.com/reference/android/os/Looper
