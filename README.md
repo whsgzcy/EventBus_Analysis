@@ -1469,6 +1469,164 @@ void invokeSubscriber(Subscription subscription, Object event) {
 
 一个搞java的，弄到现在才知道是反射，汗颜！！！
 
+非Main 在新起的一个Thread中执行
+
+```
+ /**
+     * Invokes the subscriber if the subscriptions is still active. Skipping subscriptions prevents race conditions
+     * between {@link #unregister(Object)} and event delivery. Otherwise the event might be delivered after the
+     * subscriber unregistered. This is particularly important for main thread delivery and registrations bound to the
+     * live cycle of an Activity or Fragment.
+     */
+    void invokeSubscriber(PendingPost pendingPost) {
+        Object event = pendingPost.event;
+        Subscription subscription = pendingPost.subscription;
+        PendingPost.releasePendingPost(pendingPost);
+        if (subscription.active) {
+            invokeSubscriber(subscription, event);
+        }
+    }
+```
+
+其实还有一个大点，注解，（注解+反射）+反射，[了解](https://www.jianshu.com/p/07ef8ba80562).
+
+这段代码真的非常精彩，看了半天才弄懂，原来他是弄了一个队列，是对队列进行操作，这是数据结构 + 反射了
+
+当然，BackgroundPoster、AsyncPoster 也都是一样的
+
+```
+final class BackgroundPoster implements Runnable, Poster {
+
+    private final PendingPostQueue queue;
+    private final EventBus eventBus;
+
+    private volatile boolean executorRunning;
+
+    BackgroundPoster(EventBus eventBus) {
+        this.eventBus = eventBus;
+        queue = new PendingPostQueue();
+    }
+
+    public void enqueue(Subscription subscription, Object event) {
+        PendingPost pendingPost = PendingPost.obtainPendingPost(subscription, event);
+        synchronized (this) {
+            queue.enqueue(pendingPost);
+            if (!executorRunning) {
+                executorRunning = true;
+                eventBus.getExecutorService().execute(this);
+            }
+        }
+    }
+
+    @Override
+    public void run() {
+        try {
+            try {
+                while (true) {
+                    PendingPost pendingPost = queue.poll(1000);
+                    if (pendingPost == null) {
+                        synchronized (this) {
+                            // Check again, this time in synchronized
+                            pendingPost = queue.poll();
+                            if (pendingPost == null) {
+                                executorRunning = false;
+                                return;
+                            }
+                        }
+                    }
+                    eventBus.invokeSubscriber(pendingPost);
+                }
+            } catch (InterruptedException e) {
+                eventBus.getLogger().log(Level.WARNING, Thread.currentThread().getName() + " was interruppted", e);
+            }
+        } finally {
+            executorRunning = false;
+        }
+    }
+
+}
+
+final class PendingPostQueue {
+
+    private PendingPost head;
+    private PendingPost tail;
+
+    synchronized void enqueue(PendingPost pendingPost) {
+        if (pendingPost == null) {
+            throw new NullPointerException("null cannot be enqueued");
+        }
+        if (tail != null) {
+            tail.next = pendingPost;
+            tail = pendingPost;
+        } else if (head == null) {
+            head = tail = pendingPost;
+        } else {
+            throw new IllegalStateException("Head present, but no tail");
+        }
+        notifyAll();
+    }
+
+    synchronized PendingPost poll() {
+        PendingPost pendingPost = head;
+        if (head != null) {
+            head = head.next;
+            if (head == null) {
+                tail = null;
+            }
+        }
+        return pendingPost;
+    }
+
+    synchronized PendingPost poll(int maxMillisToWait) throws InterruptedException {
+        if (head == null) {
+            wait(maxMillisToWait);
+        }
+        return poll();
+    }
+
+}
+
+final class PendingPost {
+    private final static List<PendingPost> pendingPostPool = new ArrayList<PendingPost>();
+
+    Object event;
+    Subscription subscription;
+    PendingPost next;
+
+    private PendingPost(Object event, Subscription subscription) {
+        this.event = event;
+        this.subscription = subscription;
+    }
+
+    static PendingPost obtainPendingPost(Subscription subscription, Object event) {
+        synchronized (pendingPostPool) {
+            int size = pendingPostPool.size();
+            if (size > 0) {
+                PendingPost pendingPost = pendingPostPool.remove(size - 1);
+                pendingPost.event = event;
+                pendingPost.subscription = subscription;
+                pendingPost.next = null;
+                return pendingPost;
+            }
+        }
+        return new PendingPost(event, subscription);
+    }
+
+    static void releasePendingPost(PendingPost pendingPost) {
+        pendingPost.event = null;
+        pendingPost.subscription = null;
+        pendingPost.next = null;
+        synchronized (pendingPostPool) {
+            // Don't let the pool grow indefinitely
+            if (pendingPostPool.size() < 10000) {
+                pendingPostPool.add(pendingPost);
+            }
+        }
+    }
+
+}
+```
+
 ************************************************************
 1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
 
@@ -1485,6 +1643,9 @@ ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互
 2、多线程处理的方式，真的得去多了解，CopyOnWriteArrayList 就是一个很好的方式，以及四大线程池处理方式，也是一种拓展
 
 4、java 反射
+
+5、看了Eventbus之后，我以后不会用EventBus了
+
 
 参考资料：
 
@@ -1505,5 +1666,3 @@ https://developer.android.com/reference/android/os/Looper
 http://www.trinea.cn/android/java-android-thread-pool/
 
 https://blog.csdn.net/linsongbin1/article/details/54581787
-
-https://blog.csdn.net/wenyuan65/article/details/81145900
