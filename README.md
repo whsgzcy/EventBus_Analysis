@@ -1197,6 +1197,16 @@ instance = EventBus.defaultInstance = new EventBus();
 ```
 从使用的角度来说，在这里就是把event post出去，仔细分析一下，
 
+流程：
+
+post---->postSingleEvent()---->postSingleEventForType()---->递归post()
+
+PostingThreadState里封装了对着一类Event的描述
+
+PostingThreadState postingState = currentPostingThreadState.get();
+        List<Object> eventQueue = postingState.eventQueue;
+        eventQueue.add(event);     
+
 ```
  /** Posts the given event to the event bus. */
     public void post(Object event) {
@@ -1221,6 +1231,67 @@ instance = EventBus.defaultInstance = new EventBus();
         }
     }
 ```
+
+如果eventQueue不为empty则调用此方法
+
+```
+private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
+        Class<?> eventClass = event.getClass();
+        boolean subscriptionFound = false;
+        if (eventInheritance) {
+            List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
+            int countTypes = eventTypes.size();
+            for (int h = 0; h < countTypes; h++) {
+                Class<?> clazz = eventTypes.get(h);
+                subscriptionFound |= postSingleEventForEventType(event, postingState, clazz);
+            }
+        } else {
+            subscriptionFound = postSingleEventForEventType(event, postingState, eventClass);
+        }
+        if (!subscriptionFound) {
+            if (logNoSubscriberMessages) {
+                logger.log(Level.FINE, "No subscribers registered for event " + eventClass);
+            }
+            if (sendNoSubscriberEvent && eventClass != NoSubscriberEvent.class &&
+                    eventClass != SubscriberExceptionEvent.class) {
+                post(new NoSubscriberEvent(this, event));
+            }
+        }
+    }
+```   
+
+有一个eventInheritance标志
+
+在EventBusBuilder中观察到使用了如下代码：这个可以参考[here](http://www.trinea.cn/android/java-android-thread-pool/).
+
+    private final static ExecutorService DEFAULT_EXECUTOR_SERVICE = Executors.newCachedThreadPool();
+
+在EventBusBuilder中和EventBus都能看到 eventInheritance的身影，我也很纳闷，这东西是什么？表达什么样的意义？
+
+注释：默认的是，EventBus 认为事件的class是有等级的(订阅者订阅的event的父类也可以被通知到)
+关闭这些将提升post event的效率，对直接继承Object的简单类而言
+我们测量事件post的速度上升了20%，对于更多复杂的等级的event，速率将会大于20%
+当然，记住事件发布通常只会需要消耗一小部分的cpu在app中
+除非post一些非常高频的速率 eg...
+
+通过注释，eventInheritance我姑且认为这是一个 is : event class hierarchy?
+
+```
+ /**
+     * By default, EventBus considers the event class hierarchy (subscribers to super classes will be notified).
+     * Switching this feature off will improve posting of events. For simple event classes extending Object directly,
+     * we measured a speed up of 20% for event posting. For more complex event hierarchies, the speed up should be
+     * >20%.
+     * <p/>
+     * However, keep in mind that event posting usually consumes just a small proportion of CPU time inside an app,
+     * unless it is posting at high rates, e.g. hundreds/thousands of events per second.
+     */
+    public EventBusBuilder eventInheritance(boolean eventInheritance) {
+        this.eventInheritance = eventInheritance;
+        return this;
+    }
+```
+
 PostingThreadState postingState = currentPostingThreadState.get();
 
 ThreadLocal：
@@ -1233,6 +1304,9 @@ java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机
 使用正确的同步
 不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
 ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
+
+final List<Object> eventQueue = new ArrayList<>();
+可以看成一个事件队列的缓冲区
 
 ```
 private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
@@ -1264,7 +1338,6 @@ private final ThreadLocal<PostingThreadState> currentPostingThreadState = new Th
 Looper.myLooper()
 
 Return the Looper object associated with the current thread. Returns null if the calling thread is not associated with a Looper.
-
 
 ```
 /**
@@ -1298,7 +1371,105 @@ public interface MainThreadSupport {
 }
 ```
 
+我们再来看一下postSingleEventForEventType
 
+结构体：CopyOnWriteArrayList<Subscription> subscriptions;线程安全并发，可以参考[here](https://blog.csdn.net/linsongbin1/article/details/54581787).
+
+```
+ private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
+        CopyOnWriteArrayList<Subscription> subscriptions;
+        synchronized (this) {
+            subscriptions = subscriptionsByEventType.get(eventClass);
+        }
+        if (subscriptions != null && !subscriptions.isEmpty()) {
+            for (Subscription subscription : subscriptions) {
+                postingState.event = event;
+                postingState.subscription = subscription;
+                boolean aborted = false;
+                try {
+                    postToSubscription(subscription, event, postingState.isMainThread);
+                    aborted = postingState.canceled;
+                } finally {
+                    postingState.event = null;
+                    postingState.subscription = null;
+                    postingState.canceled = false;
+                }
+                if (aborted) {
+                    break;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+```
+
+终于到了postToSubscription，真正的要发送给订阅者了，我们先看 case Main
+
+```
+ private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
+        switch (subscription.subscriberMethod.threadMode) {
+            case POSTING:
+                invokeSubscriber(subscription, event);
+                break;
+            case MAIN:
+                if (isMainThread) {
+                    invokeSubscriber(subscription, event);
+                } else {
+                    mainThreadPoster.enqueue(subscription, event);
+                }
+                break;
+            case MAIN_ORDERED:
+                if (mainThreadPoster != null) {
+                    mainThreadPoster.enqueue(subscription, event);
+                } else {
+                    // temporary: technically not correct as poster not decoupled from subscriber
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case BACKGROUND:
+                if (isMainThread) {
+                    backgroundPoster.enqueue(subscription, event);
+                } else {
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case ASYNC:
+                asyncPoster.enqueue(subscription, event);
+                break;
+            default:
+                throw new IllegalStateException("Unknown thread mode: " + subscription.subscriberMethod.threadMode);
+        }
+    }
+```
+
+实现方法
+
+subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+
+```
+void invokeSubscriber(Subscription subscription, Object event) {
+        try {
+            subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+        } catch (InvocationTargetException e) {
+            handleSubscriberException(subscription, event, e.getCause());
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Unexpected exception", e);
+        }
+    }
+```
+
+[了解](https://blog.csdn.net/wenyuan65/article/details/81145900).
+
+反射，全文的重点！！！！
+
+反射，全文的重点！！！！
+
+反射，全文的重点！！！！
+
+整个分析来分析去，讲的就是怎么去反射！！！
+
+over，不分析了！！！
 
 ************************************************************
 1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
@@ -1313,6 +1484,9 @@ java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机
 不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
 ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
 
+2、多线程处理的方式，真的得去多了解，CopyOnWriteArrayList 就是一个很好的方式，以及四大线程池处理方式，也是一种拓展
+
+4、java 反射
 
 参考资料：
 
@@ -1329,3 +1503,9 @@ https://blog.csdn.net/luoshengyang/article/details/6595744
 https://liuzhengyang.github.io/2017/11/02/thread-local/
 
 https://developer.android.com/reference/android/os/Looper
+
+http://www.trinea.cn/android/java-android-thread-pool/
+
+https://blog.csdn.net/linsongbin1/article/details/54581787
+
+https://blog.csdn.net/wenyuan65/article/details/81145900
