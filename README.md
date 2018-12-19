@@ -483,6 +483,96 @@ final class PendingPost {
 }
 ```
 
+mainThreadPoster.enqueue(subscription, event);
+
+是在这里实现
+
+
+```
+ EventBus(EventBusBuilder builder) {
+        logger = builder.getLogger();
+        subscriptionsByEventType = new HashMap<>();
+        typesBySubscriber = new HashMap<>();
+        stickyEvents = new ConcurrentHashMap<>();
+        mainThreadSupport = builder.getMainThreadSupport();
+        mainThreadPoster = mainThreadSupport != null ? mainThreadSupport.createPoster(this) : null;
+       ......
+    }
+    
+    // 返回 MainThreadSupport.AndroidHandlerMainThreadSupport
+     MainThreadSupport getMainThreadSupport() {
+        if (mainThreadSupport != null) {
+            return mainThreadSupport;
+        } else if (AndroidLogger.isAndroidLogAvailable()) {
+            Object looperOrNull = getAndroidMainLooperOrNull();
+            return looperOrNull == null ? null :
+                    new MainThreadSupport.AndroidHandlerMainThreadSupport((Looper) looperOrNull);
+        } else {
+            return null;
+        }
+    }
+    
+    // 最终在此反射
+    public class HandlerPoster extends Handler implements Poster {
+
+    private final PendingPostQueue queue;
+    private final int maxMillisInsideHandleMessage;
+    private final EventBus eventBus;
+    private boolean handlerActive;
+
+    protected HandlerPoster(EventBus eventBus, Looper looper, int maxMillisInsideHandleMessage) {
+        super(looper);
+        this.eventBus = eventBus;
+        this.maxMillisInsideHandleMessage = maxMillisInsideHandleMessage;
+        queue = new PendingPostQueue();
+    }
+
+    public void enqueue(Subscription subscription, Object event) {
+        PendingPost pendingPost = PendingPost.obtainPendingPost(subscription, event);
+        synchronized (this) {
+            queue.enqueue(pendingPost);
+            if (!handlerActive) {
+                handlerActive = true;
+                if (!sendMessage(obtainMessage())) {
+                    throw new EventBusException("Could not send handler message");
+                }
+            }
+        }
+    }
+
+    @Override
+    public void handleMessage(Message msg) {
+        boolean rescheduled = false;
+        try {
+            long started = SystemClock.uptimeMillis();
+            while (true) {
+                PendingPost pendingPost = queue.poll();
+                if (pendingPost == null) {
+                    synchronized (this) {
+                        // Check again, this time in synchronized
+                        pendingPost = queue.poll();
+                        if (pendingPost == null) {
+                            handlerActive = false;
+                            return;
+                        }
+                    }
+                }
+                eventBus.invokeSubscriber(pendingPost);
+                long timeInMethod = SystemClock.uptimeMillis() - started;
+                if (timeInMethod >= maxMillisInsideHandleMessage) {
+                    if (!sendMessage(obtainMessage())) {
+                        throw new EventBusException("Could not send handler message");
+                    }
+                    rescheduled = true;
+                    return;
+                }
+            }
+        } finally {
+            handlerActive = rescheduled;
+        }
+    }
+}   
+```
 ************************************************************
 1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
 
