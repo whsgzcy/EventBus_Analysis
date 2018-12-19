@@ -297,15 +297,9 @@ void invokeSubscriber(Subscription subscription, Object event) {
     }
 ```
 
-反射，核心！！！！
+反射，好吧，整个分析来分析去，就是在反射的基础上构建业务！
 
-反射，核心！！！！
-
-反射，核心！！！！
-
-整个分析来分析去，就是在反射的基础上构建业务！！！
-
-一个搞java的，弄到现在才知道是反射，汗颜！！！
+代码读到这里就很清楚了，
 
 非Main 在新起的一个Thread中执行
 
@@ -506,7 +500,7 @@ ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互
 
 4、反射
 
-5、看了Eventbus之后，我以后对框架会看的更透彻
+5、EventBus的本质就是 有意义的注解+有业务需求的反射
 
 ## EventBus中的AndroidLogger & Android‘s’log
 
