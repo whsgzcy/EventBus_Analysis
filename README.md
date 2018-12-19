@@ -10,6 +10,504 @@
 
 3、自己的github需要点新的素材
 
+## EventBus 源码分析
+
+从一开始的注释我们可以看出，这是一个单例，一个process-wide范围的单例，锁了一下
+
+这句代码其实是连续赋值了
+
+instance = EventBus.defaultInstance = new EventBus();
+
+```
+/** Convenience singleton for apps using a process-wide EventBus instance. */
+    public static EventBus getDefault() {
+        EventBus instance = defaultInstance;
+        if (instance == null) {
+            synchronized (EventBus.class) {
+                instance = EventBus.defaultInstance;
+                if (instance == null) {
+                    instance = EventBus.defaultInstance = new EventBus();
+                }
+            }
+        }
+        return instance;
+    }
+```
+从使用的角度来说，在这里就是把event post出去，仔细分析一下，
+
+流程：
+
+post---->postSingleEvent()---->postSingleEventForType()---->递归post()
+
+PostingThreadState里封装了对着一类Event的描述
+
+PostingThreadState postingState = currentPostingThreadState.get();
+        List<Object> eventQueue = postingState.eventQueue;
+        eventQueue.add(event);     
+
+```
+ /** Posts the given event to the event bus. */
+    public void post(Object event) {
+        PostingThreadState postingState = currentPostingThreadState.get();
+        List<Object> eventQueue = postingState.eventQueue;
+        eventQueue.add(event);
+
+        if (!postingState.isPosting) {
+            postingState.isMainThread = isMainThread();
+            postingState.isPosting = true;
+            if (postingState.canceled) {
+                throw new EventBusException("Internal error. Abort state was not reset");
+            }
+            try {
+                while (!eventQueue.isEmpty()) {
+                    postSingleEvent(eventQueue.remove(0), postingState);
+                }
+            } finally {
+                postingState.isPosting = false;
+                postingState.isMainThread = false;
+            }
+        }
+    }
+```
+
+如果eventQueue不为empty则调用此方法
+
+```
+private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
+        Class<?> eventClass = event.getClass();
+        boolean subscriptionFound = false;
+        if (eventInheritance) {
+            List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
+            int countTypes = eventTypes.size();
+            for (int h = 0; h < countTypes; h++) {
+                Class<?> clazz = eventTypes.get(h);
+                subscriptionFound |= postSingleEventForEventType(event, postingState, clazz);
+            }
+        } else {
+            subscriptionFound = postSingleEventForEventType(event, postingState, eventClass);
+        }
+        if (!subscriptionFound) {
+            if (logNoSubscriberMessages) {
+                logger.log(Level.FINE, "No subscribers registered for event " + eventClass);
+            }
+            if (sendNoSubscriberEvent && eventClass != NoSubscriberEvent.class &&
+                    eventClass != SubscriberExceptionEvent.class) {
+                post(new NoSubscriberEvent(this, event));
+            }
+        }
+    }
+```   
+
+有一个eventInheritance标志
+
+在EventBusBuilder中观察到使用了如下代码：这个可以参考[here](http://www.trinea.cn/android/java-android-thread-pool/).
+
+    private final static ExecutorService DEFAULT_EXECUTOR_SERVICE = Executors.newCachedThreadPool();
+
+在EventBusBuilder中和EventBus都能看到 eventInheritance的身影，我也很纳闷，这东西是什么？表达什么样的意义？
+
+注释：默认的是，EventBus 认为事件的class是有等级的(订阅者订阅的event的父类也可以被通知到)
+关闭这些将提升post event的效率，对直接继承Object的简单类而言
+我们测量事件post的速度上升了20%，对于更多复杂的等级的event，速率将会大于20%
+当然，记住事件发布通常只会需要消耗一小部分的cpu在app中
+除非post一些非常高频的速率 eg...
+
+通过注释，eventInheritance我姑且认为这是一个 is : event class hierarchy?
+
+```
+ /**
+     * By default, EventBus considers the event class hierarchy (subscribers to super classes will be notified).
+     * Switching this feature off will improve posting of events. For simple event classes extending Object directly,
+     * we measured a speed up of 20% for event posting. For more complex event hierarchies, the speed up should be
+     * >20%.
+     * <p/>
+     * However, keep in mind that event posting usually consumes just a small proportion of CPU time inside an app,
+     * unless it is posting at high rates, e.g. hundreds/thousands of events per second.
+     */
+    public EventBusBuilder eventInheritance(boolean eventInheritance) {
+        this.eventInheritance = eventInheritance;
+        return this;
+    }
+```
+
+PostingThreadState postingState = currentPostingThreadState.get();
+
+ThreadLocal：
+java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
+说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
+说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
+
+不共享
+不可变
+使用正确的同步
+不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
+ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
+
+final List<Object> eventQueue = new ArrayList<>();
+可以看成一个事件队列的缓冲区
+
+```
+private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
+        @Override
+        protected PostingThreadState initialValue() {
+            return new PostingThreadState();
+        }
+    };
+```
+
+```
+/** For ThreadLocal, much faster to set (and get multiple values). */
+    final static class PostingThreadState {
+        final List<Object> eventQueue = new ArrayList<>();
+        boolean isPosting;
+        boolean isMainThread;
+        Subscription subscription;
+        Object event;
+        boolean canceled;
+    }
+```
+
+这里的 isMainThread 是由 MainThreadSupport 负责，我也纳闷，这怎么判断是主线程还是子线程的？ 通过注释可以看出，通常android是android main线程
+
+是不是Main线程：return looper == Looper.myLooper();看到这里，我的想法，这里的实现是不是又在kernel实现的？
+
+从官网上看，就暂且理解为Thread.currentThread().getName()，Looper不为null都为Main Thread
+
+Looper.myLooper()
+
+Return the Looper object associated with the current thread. Returns null if the calling thread is not associated with a Looper.
+
+```
+/**
+ * Interface to the "main" thread, which can be whatever you like. Typically on Android, Android's main thread is used.
+ */
+public interface MainThreadSupport {
+
+    boolean isMainThread();
+
+    Poster createPoster(EventBus eventBus);
+
+    class AndroidHandlerMainThreadSupport implements MainThreadSupport {
+
+        private final Looper looper;
+
+        public AndroidHandlerMainThreadSupport(Looper looper) {
+            this.looper = looper;
+        }
+
+        @Override
+        public boolean isMainThread() {
+            return looper == Looper.myLooper();
+        }
+
+        @Override
+        public Poster createPoster(EventBus eventBus) {
+            return new HandlerPoster(eventBus, looper, 10);
+        }
+    }
+
+}
+```
+
+我们再来看一下postSingleEventForEventType
+
+结构体：CopyOnWriteArrayList<Subscription> subscriptions;线程安全并发，可以参考[here](https://blog.csdn.net/linsongbin1/article/details/54581787).
+
+```
+ private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
+        CopyOnWriteArrayList<Subscription> subscriptions;
+        synchronized (this) {
+            subscriptions = subscriptionsByEventType.get(eventClass);
+        }
+        if (subscriptions != null && !subscriptions.isEmpty()) {
+            for (Subscription subscription : subscriptions) {
+                postingState.event = event;
+                postingState.subscription = subscription;
+                boolean aborted = false;
+                try {
+                    postToSubscription(subscription, event, postingState.isMainThread);
+                    aborted = postingState.canceled;
+                } finally {
+                    postingState.event = null;
+                    postingState.subscription = null;
+                    postingState.canceled = false;
+                }
+                if (aborted) {
+                    break;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+```
+
+终于到了postToSubscription，真正的要发送给订阅者了，我们先看 case Main
+
+```
+ private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
+        switch (subscription.subscriberMethod.threadMode) {
+            case POSTING:
+                invokeSubscriber(subscription, event);
+                break;
+            case MAIN:
+                if (isMainThread) {
+                    invokeSubscriber(subscription, event);
+                } else {
+                    mainThreadPoster.enqueue(subscription, event);
+                }
+                break;
+            case MAIN_ORDERED:
+                if (mainThreadPoster != null) {
+                    mainThreadPoster.enqueue(subscription, event);
+                } else {
+                    // temporary: technically not correct as poster not decoupled from subscriber
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case BACKGROUND:
+                if (isMainThread) {
+                    backgroundPoster.enqueue(subscription, event);
+                } else {
+                    invokeSubscriber(subscription, event);
+                }
+                break;
+            case ASYNC:
+                asyncPoster.enqueue(subscription, event);
+                break;
+            default:
+                throw new IllegalStateException("Unknown thread mode: " + subscription.subscriberMethod.threadMode);
+        }
+    }
+```
+
+实现方法
+
+subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+
+```
+void invokeSubscriber(Subscription subscription, Object event) {
+        try {
+            subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+        } catch (InvocationTargetException e) {
+            handleSubscriberException(subscription, event, e.getCause());
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Unexpected exception", e);
+        }
+    }
+```
+
+反射，核心！！！！
+
+反射，核心！！！！
+
+反射，核心！！！！
+
+整个分析来分析去，就是在反射的基础上构建业务！！！
+
+一个搞java的，弄到现在才知道是反射，汗颜！！！
+
+非Main 在新起的一个Thread中执行
+
+```
+ /**
+     * Invokes the subscriber if the subscriptions is still active. Skipping subscriptions prevents race conditions
+     * between {@link #unregister(Object)} and event delivery. Otherwise the event might be delivered after the
+     * subscriber unregistered. This is particularly important for main thread delivery and registrations bound to the
+     * live cycle of an Activity or Fragment.
+     */
+    void invokeSubscriber(PendingPost pendingPost) {
+        Object event = pendingPost.event;
+        Subscription subscription = pendingPost.subscription;
+        PendingPost.releasePendingPost(pendingPost);
+        if (subscription.active) {
+            invokeSubscriber(subscription, event);
+        }
+    }
+```
+
+其实还有一个大点，注解，（注解+反射）+反射，[了解](https://www.jianshu.com/p/07ef8ba80562).
+
+这段代码真的非常精彩，看了半天才弄懂，原来他是弄了一个队列，是对队列进行操作，这是数据结构 + 反射了
+
+当然，BackgroundPoster、AsyncPoster 也都是一样的
+
+模拟出一个队列结构出来
+
+一个线程的监听
+
+```
+ while (true) {
+                    PendingPost pendingPost = queue.poll(1000);
+                    if (pendingPost == null) {
+                        synchronized (this) {
+                            // Check again, this time in synchronized
+                            pendingPost = queue.poll();
+                            if (pendingPost == null) {
+                                executorRunning = false;
+                                return;
+                            }
+                        }
+                    }
+                    eventBus.invokeSubscriber(pendingPost);
+                }
+```
+
+    private final static List<PendingPost> pendingPostPool = new ArrayList<PendingPost>();
+
+
+```
+final class BackgroundPoster implements Runnable, Poster {
+
+    private final PendingPostQueue queue;
+    private final EventBus eventBus;
+
+    private volatile boolean executorRunning;
+
+    BackgroundPoster(EventBus eventBus) {
+        this.eventBus = eventBus;
+        queue = new PendingPostQueue();
+    }
+
+    public void enqueue(Subscription subscription, Object event) {
+        PendingPost pendingPost = PendingPost.obtainPendingPost(subscription, event);
+        synchronized (this) {
+            queue.enqueue(pendingPost);
+            if (!executorRunning) {
+                executorRunning = true;
+                eventBus.getExecutorService().execute(this);
+            }
+        }
+    }
+
+    @Override
+    public void run() {
+        try {
+            try {
+                while (true) {
+                    PendingPost pendingPost = queue.poll(1000);
+                    if (pendingPost == null) {
+                        synchronized (this) {
+                            // Check again, this time in synchronized
+                            pendingPost = queue.poll();
+                            if (pendingPost == null) {
+                                executorRunning = false;
+                                return;
+                            }
+                        }
+                    }
+                    eventBus.invokeSubscriber(pendingPost);
+                }
+            } catch (InterruptedException e) {
+                eventBus.getLogger().log(Level.WARNING, Thread.currentThread().getName() + " was interruppted", e);
+            }
+        } finally {
+            executorRunning = false;
+        }
+    }
+
+}
+
+final class PendingPostQueue {
+
+    private PendingPost head;
+    private PendingPost tail;
+
+    synchronized void enqueue(PendingPost pendingPost) {
+        if (pendingPost == null) {
+            throw new NullPointerException("null cannot be enqueued");
+        }
+        if (tail != null) {
+            tail.next = pendingPost;
+            tail = pendingPost;
+        } else if (head == null) {
+            head = tail = pendingPost;
+        } else {
+            throw new IllegalStateException("Head present, but no tail");
+        }
+        notifyAll();
+    }
+
+    synchronized PendingPost poll() {
+        PendingPost pendingPost = head;
+        if (head != null) {
+            head = head.next;
+            if (head == null) {
+                tail = null;
+            }
+        }
+        return pendingPost;
+    }
+
+    synchronized PendingPost poll(int maxMillisToWait) throws InterruptedException {
+        if (head == null) {
+            wait(maxMillisToWait);
+        }
+        return poll();
+    }
+
+}
+
+final class PendingPost {
+    private final static List<PendingPost> pendingPostPool = new ArrayList<PendingPost>();
+
+    Object event;
+    Subscription subscription;
+    PendingPost next;
+
+    private PendingPost(Object event, Subscription subscription) {
+        this.event = event;
+        this.subscription = subscription;
+    }
+
+    static PendingPost obtainPendingPost(Subscription subscription, Object event) {
+        synchronized (pendingPostPool) {
+            int size = pendingPostPool.size();
+            if (size > 0) {
+                PendingPost pendingPost = pendingPostPool.remove(size - 1);
+                pendingPost.event = event;
+                pendingPost.subscription = subscription;
+                pendingPost.next = null;
+                return pendingPost;
+            }
+        }
+        return new PendingPost(event, subscription);
+    }
+
+    static void releasePendingPost(PendingPost pendingPost) {
+        pendingPost.event = null;
+        pendingPost.subscription = null;
+        pendingPost.next = null;
+        synchronized (pendingPostPool) {
+            // Don't let the pool grow indefinitely
+            if (pendingPostPool.size() < 10000) {
+                pendingPostPool.add(pendingPost);
+            }
+        }
+    }
+
+}
+```
+
+************************************************************
+1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
+
+java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
+说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
+说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
+
+不共享
+不可变
+使用正确的同步
+不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
+ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
+
+2、多线程处理的方式，真的得去多了解，CopyOnWriteArrayList 就是一个很好的方式，以及四大线程池处理方式，也是一种拓展
+
+4、反射
+
+5、看了Eventbus之后，我以后对框架会看的更透彻
+
 ## EventBus中的AndroidLogger & Android‘s’log
 
 ```
@@ -1170,482 +1668,6 @@ static int __write_to_log_kernel(log_id_t log_id, struct iovec *vec, size_t nr)
 3、wq成员变量是一个等待队列，用于保存正在等待读取日志的进程  ???这里着实不能理解 ，等待队列 怎么保护进程？？？需求是什么样的？结构体的应用场景是什么样的？
 
 4、对于log，java层只是调用，真正的实现确是在C
-
-
-## EventBus 源码分析
-
-从一开始的注释我们可以看出，这是一个单例，一个process-wide范围的单例，锁了一下
-
-这句代码其实是连续复制了
-
-instance = EventBus.defaultInstance = new EventBus();
-
-```
-/** Convenience singleton for apps using a process-wide EventBus instance. */
-    public static EventBus getDefault() {
-        EventBus instance = defaultInstance;
-        if (instance == null) {
-            synchronized (EventBus.class) {
-                instance = EventBus.defaultInstance;
-                if (instance == null) {
-                    instance = EventBus.defaultInstance = new EventBus();
-                }
-            }
-        }
-        return instance;
-    }
-```
-从使用的角度来说，在这里就是把event post出去，仔细分析一下，
-
-流程：
-
-post---->postSingleEvent()---->postSingleEventForType()---->递归post()
-
-PostingThreadState里封装了对着一类Event的描述
-
-PostingThreadState postingState = currentPostingThreadState.get();
-        List<Object> eventQueue = postingState.eventQueue;
-        eventQueue.add(event);     
-
-```
- /** Posts the given event to the event bus. */
-    public void post(Object event) {
-        PostingThreadState postingState = currentPostingThreadState.get();
-        List<Object> eventQueue = postingState.eventQueue;
-        eventQueue.add(event);
-
-        if (!postingState.isPosting) {
-            postingState.isMainThread = isMainThread();
-            postingState.isPosting = true;
-            if (postingState.canceled) {
-                throw new EventBusException("Internal error. Abort state was not reset");
-            }
-            try {
-                while (!eventQueue.isEmpty()) {
-                    postSingleEvent(eventQueue.remove(0), postingState);
-                }
-            } finally {
-                postingState.isPosting = false;
-                postingState.isMainThread = false;
-            }
-        }
-    }
-```
-
-如果eventQueue不为empty则调用此方法
-
-```
-private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
-        Class<?> eventClass = event.getClass();
-        boolean subscriptionFound = false;
-        if (eventInheritance) {
-            List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
-            int countTypes = eventTypes.size();
-            for (int h = 0; h < countTypes; h++) {
-                Class<?> clazz = eventTypes.get(h);
-                subscriptionFound |= postSingleEventForEventType(event, postingState, clazz);
-            }
-        } else {
-            subscriptionFound = postSingleEventForEventType(event, postingState, eventClass);
-        }
-        if (!subscriptionFound) {
-            if (logNoSubscriberMessages) {
-                logger.log(Level.FINE, "No subscribers registered for event " + eventClass);
-            }
-            if (sendNoSubscriberEvent && eventClass != NoSubscriberEvent.class &&
-                    eventClass != SubscriberExceptionEvent.class) {
-                post(new NoSubscriberEvent(this, event));
-            }
-        }
-    }
-```   
-
-有一个eventInheritance标志
-
-在EventBusBuilder中观察到使用了如下代码：这个可以参考[here](http://www.trinea.cn/android/java-android-thread-pool/).
-
-    private final static ExecutorService DEFAULT_EXECUTOR_SERVICE = Executors.newCachedThreadPool();
-
-在EventBusBuilder中和EventBus都能看到 eventInheritance的身影，我也很纳闷，这东西是什么？表达什么样的意义？
-
-注释：默认的是，EventBus 认为事件的class是有等级的(订阅者订阅的event的父类也可以被通知到)
-关闭这些将提升post event的效率，对直接继承Object的简单类而言
-我们测量事件post的速度上升了20%，对于更多复杂的等级的event，速率将会大于20%
-当然，记住事件发布通常只会需要消耗一小部分的cpu在app中
-除非post一些非常高频的速率 eg...
-
-通过注释，eventInheritance我姑且认为这是一个 is : event class hierarchy?
-
-```
- /**
-     * By default, EventBus considers the event class hierarchy (subscribers to super classes will be notified).
-     * Switching this feature off will improve posting of events. For simple event classes extending Object directly,
-     * we measured a speed up of 20% for event posting. For more complex event hierarchies, the speed up should be
-     * >20%.
-     * <p/>
-     * However, keep in mind that event posting usually consumes just a small proportion of CPU time inside an app,
-     * unless it is posting at high rates, e.g. hundreds/thousands of events per second.
-     */
-    public EventBusBuilder eventInheritance(boolean eventInheritance) {
-        this.eventInheritance = eventInheritance;
-        return this;
-    }
-```
-
-PostingThreadState postingState = currentPostingThreadState.get();
-
-ThreadLocal：
-java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
-说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
-说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
-
-不共享
-不可变
-使用正确的同步
-不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
-ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
-
-final List<Object> eventQueue = new ArrayList<>();
-可以看成一个事件队列的缓冲区
-
-```
-private final ThreadLocal<PostingThreadState> currentPostingThreadState = new ThreadLocal<PostingThreadState>() {
-        @Override
-        protected PostingThreadState initialValue() {
-            return new PostingThreadState();
-        }
-    };
-```
-
-```
-/** For ThreadLocal, much faster to set (and get multiple values). */
-    final static class PostingThreadState {
-        final List<Object> eventQueue = new ArrayList<>();
-        boolean isPosting;
-        boolean isMainThread;
-        Subscription subscription;
-        Object event;
-        boolean canceled;
-    }
-```
-
-这里的 isMainThread 是由 MainThreadSupport 负责，我也纳闷，这怎么判断是主线程还是子线程的？ 通过注释可以看出，通常android是android main线程
-
-是不是Main线程：return looper == Looper.myLooper();看到这里，我的想法，这里的实现是不是又在kernel实现的？
-
-从官网上看，就暂且理解为Thread.currentThread().getName()，Looper不为null都为Main Thread
-
-Looper.myLooper()
-
-Return the Looper object associated with the current thread. Returns null if the calling thread is not associated with a Looper.
-
-```
-/**
- * Interface to the "main" thread, which can be whatever you like. Typically on Android, Android's main thread is used.
- */
-public interface MainThreadSupport {
-
-    boolean isMainThread();
-
-    Poster createPoster(EventBus eventBus);
-
-    class AndroidHandlerMainThreadSupport implements MainThreadSupport {
-
-        private final Looper looper;
-
-        public AndroidHandlerMainThreadSupport(Looper looper) {
-            this.looper = looper;
-        }
-
-        @Override
-        public boolean isMainThread() {
-            return looper == Looper.myLooper();
-        }
-
-        @Override
-        public Poster createPoster(EventBus eventBus) {
-            return new HandlerPoster(eventBus, looper, 10);
-        }
-    }
-
-}
-```
-
-我们再来看一下postSingleEventForEventType
-
-结构体：CopyOnWriteArrayList<Subscription> subscriptions;线程安全并发，可以参考[here](https://blog.csdn.net/linsongbin1/article/details/54581787).
-
-```
- private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
-        CopyOnWriteArrayList<Subscription> subscriptions;
-        synchronized (this) {
-            subscriptions = subscriptionsByEventType.get(eventClass);
-        }
-        if (subscriptions != null && !subscriptions.isEmpty()) {
-            for (Subscription subscription : subscriptions) {
-                postingState.event = event;
-                postingState.subscription = subscription;
-                boolean aborted = false;
-                try {
-                    postToSubscription(subscription, event, postingState.isMainThread);
-                    aborted = postingState.canceled;
-                } finally {
-                    postingState.event = null;
-                    postingState.subscription = null;
-                    postingState.canceled = false;
-                }
-                if (aborted) {
-                    break;
-                }
-            }
-            return true;
-        }
-        return false;
-    }
-```
-
-终于到了postToSubscription，真正的要发送给订阅者了，我们先看 case Main
-
-```
- private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
-        switch (subscription.subscriberMethod.threadMode) {
-            case POSTING:
-                invokeSubscriber(subscription, event);
-                break;
-            case MAIN:
-                if (isMainThread) {
-                    invokeSubscriber(subscription, event);
-                } else {
-                    mainThreadPoster.enqueue(subscription, event);
-                }
-                break;
-            case MAIN_ORDERED:
-                if (mainThreadPoster != null) {
-                    mainThreadPoster.enqueue(subscription, event);
-                } else {
-                    // temporary: technically not correct as poster not decoupled from subscriber
-                    invokeSubscriber(subscription, event);
-                }
-                break;
-            case BACKGROUND:
-                if (isMainThread) {
-                    backgroundPoster.enqueue(subscription, event);
-                } else {
-                    invokeSubscriber(subscription, event);
-                }
-                break;
-            case ASYNC:
-                asyncPoster.enqueue(subscription, event);
-                break;
-            default:
-                throw new IllegalStateException("Unknown thread mode: " + subscription.subscriberMethod.threadMode);
-        }
-    }
-```
-
-实现方法
-
-subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
-
-```
-void invokeSubscriber(Subscription subscription, Object event) {
-        try {
-            subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
-        } catch (InvocationTargetException e) {
-            handleSubscriberException(subscription, event, e.getCause());
-        } catch (IllegalAccessException e) {
-            throw new IllegalStateException("Unexpected exception", e);
-        }
-    }
-```
-
-反射，核心！！！！
-
-反射，核心！！！！
-
-反射，核心！！！！
-
-整个分析来分析去，就是在反射的基础上构建业务！！！
-
-一个搞java的，弄到现在才知道是反射，汗颜！！！
-
-非Main 在新起的一个Thread中执行
-
-```
- /**
-     * Invokes the subscriber if the subscriptions is still active. Skipping subscriptions prevents race conditions
-     * between {@link #unregister(Object)} and event delivery. Otherwise the event might be delivered after the
-     * subscriber unregistered. This is particularly important for main thread delivery and registrations bound to the
-     * live cycle of an Activity or Fragment.
-     */
-    void invokeSubscriber(PendingPost pendingPost) {
-        Object event = pendingPost.event;
-        Subscription subscription = pendingPost.subscription;
-        PendingPost.releasePendingPost(pendingPost);
-        if (subscription.active) {
-            invokeSubscriber(subscription, event);
-        }
-    }
-```
-
-其实还有一个大点，注解，（注解+反射）+反射，[了解](https://www.jianshu.com/p/07ef8ba80562).
-
-这段代码真的非常精彩，看了半天才弄懂，原来他是弄了一个队列，是对队列进行操作，这是数据结构 + 反射了
-
-当然，BackgroundPoster、AsyncPoster 也都是一样的
-
-```
-final class BackgroundPoster implements Runnable, Poster {
-
-    private final PendingPostQueue queue;
-    private final EventBus eventBus;
-
-    private volatile boolean executorRunning;
-
-    BackgroundPoster(EventBus eventBus) {
-        this.eventBus = eventBus;
-        queue = new PendingPostQueue();
-    }
-
-    public void enqueue(Subscription subscription, Object event) {
-        PendingPost pendingPost = PendingPost.obtainPendingPost(subscription, event);
-        synchronized (this) {
-            queue.enqueue(pendingPost);
-            if (!executorRunning) {
-                executorRunning = true;
-                eventBus.getExecutorService().execute(this);
-            }
-        }
-    }
-
-    @Override
-    public void run() {
-        try {
-            try {
-                while (true) {
-                    PendingPost pendingPost = queue.poll(1000);
-                    if (pendingPost == null) {
-                        synchronized (this) {
-                            // Check again, this time in synchronized
-                            pendingPost = queue.poll();
-                            if (pendingPost == null) {
-                                executorRunning = false;
-                                return;
-                            }
-                        }
-                    }
-                    eventBus.invokeSubscriber(pendingPost);
-                }
-            } catch (InterruptedException e) {
-                eventBus.getLogger().log(Level.WARNING, Thread.currentThread().getName() + " was interruppted", e);
-            }
-        } finally {
-            executorRunning = false;
-        }
-    }
-
-}
-
-final class PendingPostQueue {
-
-    private PendingPost head;
-    private PendingPost tail;
-
-    synchronized void enqueue(PendingPost pendingPost) {
-        if (pendingPost == null) {
-            throw new NullPointerException("null cannot be enqueued");
-        }
-        if (tail != null) {
-            tail.next = pendingPost;
-            tail = pendingPost;
-        } else if (head == null) {
-            head = tail = pendingPost;
-        } else {
-            throw new IllegalStateException("Head present, but no tail");
-        }
-        notifyAll();
-    }
-
-    synchronized PendingPost poll() {
-        PendingPost pendingPost = head;
-        if (head != null) {
-            head = head.next;
-            if (head == null) {
-                tail = null;
-            }
-        }
-        return pendingPost;
-    }
-
-    synchronized PendingPost poll(int maxMillisToWait) throws InterruptedException {
-        if (head == null) {
-            wait(maxMillisToWait);
-        }
-        return poll();
-    }
-
-}
-
-final class PendingPost {
-    private final static List<PendingPost> pendingPostPool = new ArrayList<PendingPost>();
-
-    Object event;
-    Subscription subscription;
-    PendingPost next;
-
-    private PendingPost(Object event, Subscription subscription) {
-        this.event = event;
-        this.subscription = subscription;
-    }
-
-    static PendingPost obtainPendingPost(Subscription subscription, Object event) {
-        synchronized (pendingPostPool) {
-            int size = pendingPostPool.size();
-            if (size > 0) {
-                PendingPost pendingPost = pendingPostPool.remove(size - 1);
-                pendingPost.event = event;
-                pendingPost.subscription = subscription;
-                pendingPost.next = null;
-                return pendingPost;
-            }
-        }
-        return new PendingPost(event, subscription);
-    }
-
-    static void releasePendingPost(PendingPost pendingPost) {
-        pendingPost.event = null;
-        pendingPost.subscription = null;
-        pendingPost.next = null;
-        synchronized (pendingPostPool) {
-            // Don't let the pool grow indefinitely
-            if (pendingPostPool.size() < 10000) {
-                pendingPostPool.add(pendingPost);
-            }
-        }
-    }
-
-}
-```
-
-************************************************************
-1、Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路，不共享，不可变，使用正确的同步，对于并发，从java层或业务层的描述，我认为描述到的本质，我认为这段话可以背下来，开发中天天都接触到的东西，可是用语言描述，就变得有失水准，要学会忽悠嘛
-
-java.lang.ThreadLocal<T> 类是Java提供的用来保存线程本地变量的机制。
-说道线程本地变量很容易和和线程栈帧里的本地变量表联系起来。不过ThreadLocal的最普遍的用途是避免线程安全问题和框架代码实现模板模式。
-说道线程安全又要温习一下多线程知识了。线程安全就是多线程访问下程序的不变约束、后验条件等不被破坏程序保持正确性，原子性、可见性、重排序等情况更靠近使用层，Java中引起并发问题的最基本的是共享可变变量。所以避免线程安全问题有几种思路
-
-不共享
-不可变
-使用正确的同步
-不同享的一种方式就是使用线程私有变量，例如方法中创建的对象只要没有泄露都在本线程栈的引用上，其他线程无法引用到，而一个线程的内执行是线程安全的。
-ThreadLocal变量可以让每个线程都拥有自己私有的变量而不会互相访问到，从而实现线程安全。另外一些框架比如spring-jdbc，因为java.sql.Connection不是线程安全的，会将jdbc的Connection保存在ThreadLocal中，然后在框架层负责Connection的获取、使用、释放等操作，将底层的细节向用户屏蔽，当然这是基于Javaweb服务通常都是一链接一线程的前提下。另外一些服务跟踪代码也可以利用ThreadLocal获取调用信息，这样就能把分散的跟踪日志绑定到一起。
-
-2、多线程处理的方式，真的得去多了解，CopyOnWriteArrayList 就是一个很好的方式，以及四大线程池处理方式，也是一种拓展
-
-4、java 反射
-
-5、看了Eventbus之后，我以后不会用EventBus了
-
 
 参考资料：
 
